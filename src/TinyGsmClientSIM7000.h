@@ -909,16 +909,40 @@ public:
 protected:
 
   bool modemConnect(const char* host, uint16_t port, uint8_t mux, bool ssl = false) {
-    int rsp;
-    sendAT(GF("+CIPSTART="), mux, ',', GF("\"TCP"), GF("\",\""), host, GF("\","), port);
-    rsp = waitResponse(75000L,
-                       GF("CONNECT OK" GSM_NL),
-                       GF("CONNECT FAIL" GSM_NL),
-                       GF("ALREADY CONNECT" GSM_NL),
-                       GF("ERROR" GSM_NL),
-                       GF("CLOSE OK" GSM_NL)   // Happens when HTTPS handshake fails
-                      );
-    return (1 == rsp);
+    if (ssl) {
+      // use TLS
+      int rsp;
+      sendAT(GF("+CNACT=1")); // activate the wireless connection
+      if (waitResponse() != 1) {
+        DBG("### Unable to open wireless connection.");
+      }
+      sendAT(GF("+CACID="), mux); // configure the cid
+      if (waitResponse() != 1) {
+        DBG("### Error while setting <cid>.");
+      }
+      sendAT(GF("+CSSLCFG=\"sslversion\","), mux, GF(","), 3); // sslversion = TLS 1.2
+      if (waitResponse() != 1) {
+        DBG("### Error while configuring sslversion.");
+      }
+      // TODO: add certificate uploading and conversion (server only)
+      // currently trusts all server certificates
+      sendAT(GF("+CAOPEN="), mux, GF(",\""), GF(host), GF("\","), port); // connect to host
+      if (waitResponse() != 1) {
+        DBG("### Error while connecting to host.");
+      }
+    } else {
+      // don't use TLS
+      int rsp;
+      sendAT(GF("+CIPSTART="), mux, ',', GF("\"TCP"), GF("\",\""), host, GF("\","), port);
+      rsp = waitResponse(75000L,
+                         GF("CONNECT OK" GSM_NL),
+                         GF("CONNECT FAIL" GSM_NL),
+                         GF("ALREADY CONNECT" GSM_NL),
+                         GF("ERROR" GSM_NL),
+                         GF("CLOSE OK" GSM_NL)   // Happens when HTTPS handshake fails
+                        );
+      return (1 == rsp);
+    }
   }
 
   int16_t modemSend(const void* buff, size_t len, uint8_t mux) {
@@ -1002,7 +1026,7 @@ public:
     streamWrite("AT", cmd..., GSM_NL);
     stream.flush();
     TINY_GSM_YIELD();
-    //DBG("### AT:", cmd...);
+    DBG("### AT:", cmd...);
   }
 
   // TODO: Optimize this!
@@ -1064,6 +1088,7 @@ public:
       }
     } while (millis() - startMillis < timeout);
 finish:
+    DBG("### Data: ", data);
     if (!index) {
       data.trim();
       if (data.length()) {
