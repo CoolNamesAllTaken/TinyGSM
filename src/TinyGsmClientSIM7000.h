@@ -9,6 +9,8 @@
 #ifndef TinyGsmClientSIM7000_h
 #define TinyGsmClientSIM7000_h
 
+#define DEBUG_STREAM // print out skipped parts of stream
+
 #define TINY_GSM_DEBUG Serial
 //#define TINY_GSM_USE_HEX
 
@@ -23,6 +25,8 @@
 #define GSM_NL "\r\n"
 static const char GSM_OK[] TINY_GSM_PROGMEM = "OK" GSM_NL;
 static const char GSM_ERROR[] TINY_GSM_PROGMEM = "ERROR" GSM_NL;
+
+static const uint32_t socket_update_interval_ms = 10000; // update interval for sockets, milliseconds
 
 enum SimStatus {
   SIM_ERROR = 0,
@@ -55,6 +59,10 @@ class TinyGsmSim7000 : public TinyGsmModem
       typedef TinyGsmFifo<uint8_t, TINY_GSM_RX_BUFFER> RxFifo;
 
       public:
+        uint32_t       prev_check;
+        bool           sock_connected;
+        bool           got_data;
+
         GsmClient() {}
 
         GsmClient(TinyGsmSim7000& modem, uint8_t mux = 1) {
@@ -83,6 +91,7 @@ class TinyGsmSim7000 : public TinyGsmModem
         }
 
         virtual int connect(IPAddress ip, uint16_t port) {
+          DBG("### CONNECTING TO UNSECURE GSM CLIENT OVER IP");
           String host; host.reserve(16);
           host += ip[0];
           host += ".";
@@ -102,15 +111,13 @@ class TinyGsmSim7000 : public TinyGsmModem
           // Doing it this way allows the external mcu to find and get all of the data
           // that it wants from the socket even if it was closed externally.
           rx.clear();
-          at->maintain();
           // transfer from modem to FIFO and dump continuously until modem has no more data
           while (at->modemReadAll((uint16_t)rx.free(), mux)) {
             rx.clear();
-            at->maintain();
           }
           at->sendAT(GF("+CACLOSE="), mux);
           sock_connected = false;
-          at->waitResponse();
+          at->waitResponse(5000L); // takes a while to close
         }
 
         /**
@@ -155,17 +162,7 @@ class TinyGsmSim7000 : public TinyGsmModem
         **/
         virtual int available() {
           TINY_GSM_YIELD();
-          if (!rx.size()) {
-            // TODO:  Is this needed for SIM7000?
-            // Workaround: sometimes SIM7000 forgets to notify about data arrival.
-            // TODO: Currently we ping the module periodically,
-            // but maybe there's a better indicator that we need to poll
-            if (millis() - prev_check > 250) {
-              got_data = true;
-              prev_check = millis();
-            }
-            at->maintain();
-          }
+          at->maintain();
           return rx.size();
         }
 
@@ -180,7 +177,6 @@ class TinyGsmSim7000 : public TinyGsmModem
         **/
         virtual int read(uint8_t *buf, size_t size) {
           TINY_GSM_YIELD();
-          at->maintain();
           size_t cnt = 0;
           while (cnt < size) {
             size_t chunk = TinyGsmMin(size-cnt, rx.size());
@@ -190,15 +186,6 @@ class TinyGsmSim7000 : public TinyGsmModem
               cnt += chunk;
               continue;
             }
-            // TODO:  Is this needed for SIM7000?
-            // Workaround: sometimes SIM7000 forgets to notify about data arrival.
-            // TODO: Currently we ping the module periodically,
-            // but maybe there's a better indicator that we need to poll
-            if (millis() - prev_check > 250) {
-              got_data = true;
-              prev_check = millis();
-            }
-            at->maintain();
             if (at->modemReadAll((uint16_t)rx.free(), mux) == 0) {
               break; // ran out of stuff to read from modem
             }
@@ -223,6 +210,7 @@ class TinyGsmSim7000 : public TinyGsmModem
         virtual void flush() { at->stream.flush(); }
 
         virtual uint8_t connected() {
+          DBG("### CHECKING CONNECTION");
           if (available()) {
             return true;
           }
@@ -239,9 +227,9 @@ class TinyGsmSim7000 : public TinyGsmModem
       private:
         TinyGsmSim7000* at;
         uint8_t        mux;
-        uint32_t       prev_check;
-        bool           sock_connected;
-        bool           got_data;
+        // uint32_t       prev_check;
+        // bool           sock_connected;
+        // bool           got_data;
         RxFifo         rx;
     };
 
@@ -257,6 +245,7 @@ class TinyGsmSim7000 : public TinyGsmModem
 
         virtual int connect(const char *host, uint16_t port) {
           DBG("### CONNECTING TO SECURE GSM CLIENT");
+          delay(5000);
           stop();
           TINY_GSM_YIELD();
           rx.clear();
@@ -299,7 +288,7 @@ class TinyGsmSim7000 : public TinyGsmModem
 
     bool testAT(unsigned long timeout = 10000L) {
       for (unsigned long start = millis(); millis() - start < timeout; ) {
-        streamWrite(GF("AAAAA"));  // TODO: extra A's to help detect the baud rate
+        // streamWrite(GF("AAAAA"));  // TODO: extra A's to help detect the baud rate
         sendAT(GF(""));
         if (waitResponse(200) == 1) return true;
         delay(100);
@@ -315,7 +304,15 @@ class TinyGsmSim7000 : public TinyGsmModem
       // periodically check all connections when got_data flag is raised, populate sock_available
       // with whether there is data waiting to be read from the connection
       for (int mux = 0; mux < TINY_GSM_MUX_COUNT; mux++) {
+        if (!sockets[mux]) {
+          continue; // socket hasn't been populated, skip
+        }
         GsmClient* sock = sockets[mux];
+        if ((millis() - (sock->prev_check)) < socket_update_interval_ms) {
+          continue; // socket has been checked recently, skip
+        }
+        // check socket
+        sock->prev_check = millis();
         if (sock && sock->got_data) {
           if (modemReadAll((uint16_t)(sock->rx.free()), mux)) {
             // socket exists and it just dumped data into the FIFO
@@ -462,7 +459,8 @@ class TinyGsmSim7000 : public TinyGsmModem
       }
       streamSkipUntil(','); // Skip format (0)
       int status = stream.readStringUntil('\n').toInt();
-      streamSkipUntil('\n'); // ignore newline with 'OK'
+      DBG("### Network reg status: ", status);
+      waitResponse(); // ignore newline with 'OK'
       return (RegStatus)status;
     }
 
@@ -544,7 +542,7 @@ class TinyGsmSim7000 : public TinyGsmModem
     bool gprsConnect(const char* apn, const char* user = NULL, const char* pwd = NULL) {
       // gprsDisconnect();
 
-      sendAT(GF("+CNACT=1"), GF(apn)); // open wireless connection
+      sendAT(GF("+CNACT=1,"), GF(apn)); // open wireless connection
       if (waitResponse() != 1) {
         DBG("### Unable to open wireless connection.");
         return false;
@@ -570,10 +568,8 @@ class TinyGsmSim7000 : public TinyGsmModem
         return false;
       }
       int status = stream.readStringUntil(',').toInt(); // 1 = active, 0 = inactive
-      // skip 2 newlines and 'OK'
-      streamSkipUntil('\n'); // skip IP address
-      streamSkipUntil('\n');
-      streamSkipUntil('\n');
+      // skip ip address, 2 newlines and 'OK'
+      waitResponse();
       if (status != 1)
         return false;
 
@@ -884,7 +880,7 @@ class TinyGsmSim7000 : public TinyGsmModem
         // TODO: add certificate uploading and conversion (server only)
         // currently trusts all server certificates
         sendAT(GF("+CAOPEN="), mux, GF(",\""), GF(host), GF("\","), port); // connect to host
-        if (waitResponse(GF("+CAOPEN:")) != 1) {
+        if (waitResponse(5000L, GF("+CAOPEN:")) != 1) {
           DBG("### Error while connecting to host.");
         }
         streamSkipUntil(','); // skip cid
@@ -894,9 +890,7 @@ class TinyGsmSim7000 : public TinyGsmModem
           return false;
         }
         // absorb two newlines and 'OK'
-        streamSkipUntil('\n');
-        streamSkipUntil('\n');
-        streamSkipUntil('\n');
+        waitResponse();
         return true;
       } else {
         // don't use TLS
@@ -947,19 +941,20 @@ class TinyGsmSim7000 : public TinyGsmModem
       size_t total_len = 0;
       while (len > 0 && total_len < max_len) {
         sendAT(GF("+CARECV="), mux, GF(","), 100); // request 100 bytes from connection
-        DBG("### modemReadAll Error");
         if (waitResponse(GF("+CARECV:")) != 1) {
+          DBG("### modemReadAll Error");
           return 0;
         }
         streamSkipUntil(','); // skip cid
         len = stream.readStringUntil('\n').toInt(); // number of bytes actually returned
 
+        // capture received data (len bytes)
         for (size_t i=0; i<len; i++) {
           while (!stream.available()) { TINY_GSM_YIELD(); }
           char c = stream.read();
           sockets[mux]->rx.put(c);
         }
-        waitResponse();
+        waitResponse(); // wait until 'OK'
         total_len += len;
       }
       DBG("### modemReadAll read ", total_len, " bytes");
@@ -981,9 +976,7 @@ class TinyGsmSim7000 : public TinyGsmModem
       streamSkipUntil('\"');
       String ip_string = stream.readStringUntil('\"');
       // consume two newlines and "OK"
-      streamSkipUntil('\n');
-      streamSkipUntil('\n');
-      streamSkipUntil('\n');
+      waitResponse();
       DBG("### IP Address:", ip_string.c_str());
       return true;
     }
@@ -1039,18 +1032,17 @@ class TinyGsmSim7000 : public TinyGsmModem
           } else if (r5 && data.endsWith(r5)) {
             index = 5;
             goto finish;
-          } else if (data.endsWith(GF(GSM_NL "+CIPRXGET:"))) {
-            String mode = stream.readStringUntil(',');
-            if (mode.toInt() == 1) {
-              int mux = stream.readStringUntil('\n').toInt();
-              if (mux >= 0 && mux < TINY_GSM_MUX_COUNT && sockets[mux]) {
-                sockets[mux]->got_data = true;
-              }
-              data = "";
-            } else {
-              data += mode;
+          } /*else if (data.endsWith(GF(GSM_NL "+CARECV:"))) {
+            // SIM7000 notifies of data reception
+            int mux = stream.readStringUntil(',').toInt();
+            int recvlen = stream.readStringUntil('\n').toInt();
+            // TODO: read data here?  Does the modem even send CARECV?
+            if (mux >= 0 && mux < TINY_GSM_MUX_COUNT && sockets[mux]) {
+              sockets[mux]->got_data = true;
             }
-          } else if (data.endsWith(GF("CLOSED" GSM_NL))) {
+            data = "";
+          } *//*else if (data.endsWith(GF("CLOSED" GSM_NL))) {
+            // connection closed--only applies to CIP type commands
             int nl = data.lastIndexOf(GSM_NL, data.length()-8);
             int coma = data.indexOf(',', nl+2);
             int mux = data.substring(nl+2, coma).toInt();
@@ -1059,11 +1051,13 @@ class TinyGsmSim7000 : public TinyGsmModem
             }
             data = "";
             DBG("### Closed: ", mux);
-          }
+          }*/
         }
       } while (millis() - startMillis < timeout);
       finish:
+        #ifdef DEBUG_STREAM
         DBG(data);
+        #endif
         if (!index) {
           data.trim();
           if (data.length()) {
